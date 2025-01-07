@@ -1,6 +1,10 @@
 extern crate proc_macro;
 
+use std::env;
+use std::path::{Path, PathBuf};
+
 use proc_macro::{Ident, TokenStream};
+use reqwest::StatusCode;
 use syn::{parse_macro_input, Token};
 
 use syn::parse::{Parse, ParseStream};
@@ -69,10 +73,36 @@ impl Parse for MacroInput {
         })
     }
 }
+use std::io::{self, Write};
+use std::fs::File;
+use std::io::Read;
 
 #[proc_macro]
 pub fn crate_patcher(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as MacroInput);
+
+    let dir: PathBuf = std::env::var("CARGO_MANIFEST_DIR").unwrap().into();
+    let w_dir = dir.join("./target/crate_patcher/");
+    if !w_dir.exists() {
+        std::fs::create_dir_all(&w_dir).unwrap();
+    }
+
+    let crate_file_name = format!("{}-{}.crate", input.crate_name, input.version);
+
+    if !w_dir.join(&crate_file_name).exists() {
+        let mut resp = reqwest::blocking::get(format!(
+            "https://static.crates.io/crates/{}/{crate_file_name}",
+            input.crate_name
+        )).unwrap();
+        if resp.status() != StatusCode::OK {
+            panic!("couldn'd download the crate");
+        }
+
+        let body: Vec<_> = resp.bytes().unwrap().into();
+        let mut target_file = std::fs::File::create(w_dir.join(crate_file_name)).unwrap();
+        // gzip compressed data
+        std::io::copy(&mut body.as_slice(), &mut target_file).unwrap();
+    }
 
     "fn answer() -> u32 { 42 }".parse().unwrap()
 }
