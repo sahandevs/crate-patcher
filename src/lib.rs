@@ -2,6 +2,7 @@ extern crate proc_macro;
 
 use std::env;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use flate2::read::GzDecoder;
 use proc_macro::{Ident, TokenStream};
@@ -15,7 +16,7 @@ use toml_edit::Table;
 struct MacroInput {
     crate_name: String,
     version: String,
-    patches: Vec<String>,
+    // patches: Vec<String>,
 }
 
 impl Parse for MacroInput {
@@ -25,7 +26,7 @@ impl Parse for MacroInput {
         let crate_name = struct_expr.path.get_ident().unwrap().to_string();
 
         let mut version = String::new();
-        let mut patches = Vec::new();
+        // let mut patches = Vec::new();
 
         for field in struct_expr.fields {
             if let syn::Member::Named(member) = field.member {
@@ -45,23 +46,23 @@ impl Parse for MacroInput {
                             panic!("only string literal is allowd for version")
                         }
                     }
-                    "patches" => {
-                        if let syn::Expr::Array(exprs) = field.expr {
-                            for expr in exprs.elems {
-                                if let syn::Expr::Lit(syn::ExprLit {
-                                    lit: syn::Lit::Str(x),
-                                    ..
-                                }) = expr
-                                {
-                                    patches.push(x.value());
-                                } else {
-                                    panic!("only Array of strings is allowed for patches")
-                                }
-                            }
-                        } else {
-                            panic!("only Array is allowed for patches")
-                        }
-                    }
+                    // "patches" => {
+                    //     if let syn::Expr::Array(exprs) = field.expr {
+                    //         for expr in exprs.elems {
+                    //             if let syn::Expr::Lit(syn::ExprLit {
+                    //                 lit: syn::Lit::Str(x),
+                    //                 ..
+                    //             }) = expr
+                    //             {
+                    //                 patches.push(x.value());
+                    //             } else {
+                    //                 panic!("only Array of strings is allowed for patches")
+                    //             }
+                    //         }
+                    //     } else {
+                    //         panic!("only Array is allowed for patches")
+                    //     }
+                    // }
                     x => panic!("unknown member {x}"),
                 }
             } else {
@@ -72,7 +73,7 @@ impl Parse for MacroInput {
         Ok(MacroInput {
             crate_name,
             version,
-            patches,
+            // patches,
         })
     }
 }
@@ -125,7 +126,7 @@ pub fn crate_patcher(input: TokenStream) -> TokenStream {
         let mut doc = original.parse::<toml_edit::Document>().unwrap();
         let crate_doc = crate_toml.parse::<toml_edit::Document>().unwrap();
 
-        for table in ["dev-dependencies", "features", "dependencies", "lib", "bin"] {
+        for table in ["dev-dependencies", "features", "dependencies"] {
             if let Some(toml_edit::Item::Table(x)) = crate_doc.get(table) {
                 if !doc.contains_key(&table) {
                     doc.insert(&table, toml_edit::Item::Table(Table::new()));
@@ -148,5 +149,101 @@ pub fn crate_patcher(input: TokenStream) -> TokenStream {
             .expect("??");
     }
 
-    "fn answer() -> u32 { 42 }".parse().unwrap()
+    // prepare for patching
+    if !dir.join("./src/.gitignore").exists() {
+        std::fs::write(dir.join("./src/.gitignore"), "*\n!lib.rs").unwrap();
+    }
+    if !dir.join("./patches").exists() {
+        std::fs::create_dir_all(dir.join("./patches")).unwrap()
+    }
+
+    let o_crate_dir = w_dir.join(original_crate_dir);
+    // sync code and apply patches
+    let crate_files: Vec<_> = glob::glob(&format!("{}/**/*", o_crate_dir.to_str().unwrap()))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|x| x.is_file() && x.file_name().unwrap().to_str().unwrap() != "Cargo.toml")
+        .map(|x| x.strip_prefix(o_crate_dir.clone()).unwrap().to_path_buf())
+        .collect();
+
+    let current_files: Vec<_> = glob::glob(&format!("{}/src/**/*", dir.to_str().unwrap()))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|x| x.is_file())
+        .map(|x| x.strip_prefix(dir.join("./src")).unwrap().to_path_buf())
+        .collect();
+
+    // let current_patches: Vec<_> = glob::glob(&format!("{}/patches/*.patch", dir.to_str().unwrap()))
+    //     .unwrap()
+    //     .filter_map(Result::ok)
+    //     .filter(|x| x.is_file())
+    //     .collect();
+
+    for crate_file in crate_files.iter() {
+        let _ = std::fs::create_dir_all(dir.join("./src").join(crate_file).parent().unwrap());
+        let original_content = {
+            match std::fs::read_to_string(o_crate_dir.join(crate_file)) {
+                Ok(x) => x,
+                // probabely binary, just copy it over
+                Err(_) => {
+                    if !current_files.contains(crate_file) {
+                        let from = o_crate_dir.join(crate_file);
+                        let to = dir.join("./src").join(crate_file);
+                        if std::fs::copy(&from, &to).is_err() {
+                            panic!("copy failed {:?} -> {:?}", from, to);
+                        }
+                    }
+                    continue;
+                }
+            }
+        };
+
+        let patch_file_name = crate_file_to_patch_file(&crate_file.to_path_buf());
+
+        let content = if dir.join(&patch_file_name).exists() {
+            let patch_c = std::fs::read_to_string(dir.join(&patch_file_name)).unwrap();
+            let patch = diffy::Patch::from_str(patch_c.as_str()).unwrap();
+            diffy::apply(&original_content, &patch).unwrap()
+        } else {
+            original_content.clone()
+        };
+
+        let current_files_name = if crate_file.file_name().unwrap().to_str().unwrap() == "lib.rs" {
+            PathBuf::from_str("lib.crate.rs").unwrap()
+        } else {
+            crate_file.clone()
+        };
+        let target = dir.join("./src").join(&current_files_name);
+
+        if !current_files.contains(&current_files_name) {
+            std::fs::write(target, content).unwrap();
+        } else {
+            let current_file_content = std::fs::read_to_string(target).unwrap();
+            if current_file_content == content {
+                continue;
+            }
+
+            let diff = diffy::create_patch(&original_content, &current_file_content);
+
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open(dir.join(patch_file_name))
+                .expect("?")
+                .write_all(diff.to_string().as_bytes())
+                .expect("??");
+        }
+    }
+
+    // FIXME: if the structure of crate includes ./src folder, this doesn't work
+
+    r#"include!("./lib.crate.rs")"#.parse().unwrap()
+}
+
+fn crate_file_to_patch_file(crate_file_name: &PathBuf) -> PathBuf {
+    format!(
+        "patches/{}.patch",
+        crate_file_name.to_str().unwrap().replace("/", "--")
+    )
+    .into()
 }
