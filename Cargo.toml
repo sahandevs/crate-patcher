@@ -9,3 +9,6 @@ proc-macro = true
 [dependencies]
 syn = { version = "2.0", features=["full"] }
 reqwest = { version = "0.11", features = ["blocking"] }
+tar = "0.4.43"
+flate2 = "1.0.35"
+toml_edit = "0.22.22"
