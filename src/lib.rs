@@ -1,13 +1,15 @@
+#![allow(unused_variables)]
+
 extern crate proc_macro;
 
-use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 
+use file_lock::{FileLock, FileOptions};
 use flate2::read::GzDecoder;
-use proc_macro::{Ident, TokenStream};
+use proc_macro::TokenStream;
 use reqwest::StatusCode;
-use syn::{parse_macro_input, Token};
+use syn::parse_macro_input;
 
 use syn::parse::{Parse, ParseStream};
 use tar::Archive;
@@ -77,9 +79,7 @@ impl Parse for MacroInput {
         })
     }
 }
-use std::fs::File;
-use std::io::Read;
-use std::io::{self, Write};
+use std::io::Write;
 
 #[proc_macro]
 pub fn crate_patcher(input: TokenStream) -> TokenStream {
@@ -90,6 +90,15 @@ pub fn crate_patcher(input: TokenStream) -> TokenStream {
     if !w_dir.exists() {
         std::fs::create_dir_all(&w_dir).unwrap();
     }
+
+    let options = FileOptions::new().write(true).create(true).append(true);
+
+    let filelock = match FileLock::lock(w_dir.join("./crate-patcher.lock"), false, options) {
+        Ok(lock) => lock,
+        Err(err) => {
+            return r#"include!("./lib.crate.rs");"#.parse().unwrap();
+        }
+    };
 
     let crate_file_name = format!("{}-{}.crate", input.crate_name, input.version);
 
@@ -118,13 +127,13 @@ pub fn crate_patcher(input: TokenStream) -> TokenStream {
     }
 
     // update Cargo.toml
-    {
+    let lib_src_root = {
         let original = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
         let crate_toml =
             std::fs::read_to_string(w_dir.join(&original_crate_dir).join("Cargo.toml")).unwrap();
 
-        let mut doc = original.parse::<toml_edit::Document>().unwrap();
-        let crate_doc = crate_toml.parse::<toml_edit::Document>().unwrap();
+        let mut doc = original.parse::<toml_edit::DocumentMut>().unwrap();
+        let crate_doc = crate_toml.parse::<toml_edit::DocumentMut>().unwrap();
 
         for table in ["dev-dependencies", "features", "dependencies"] {
             if let Some(toml_edit::Item::Table(x)) = crate_doc.get(table) {
@@ -147,7 +156,21 @@ pub fn crate_patcher(input: TokenStream) -> TokenStream {
             .expect("?")
             .write_all(doc.to_string().as_bytes())
             .expect("??");
-    }
+
+        if doc.contains_key("lib") {
+            PathBuf::from_str(
+                doc["lib"]["path"]
+                    .as_str()
+                    .expect("[lib].path must be string"),
+            )
+            .unwrap()
+            .parent()
+            .map(|x| x.to_str().unwrap().to_owned())
+            .unwrap_or_default()
+        } else {
+            "src".to_owned()
+        }
+    };
 
     // prepare for patching
     if !dir.join("./src/.gitignore").exists() {
@@ -159,12 +182,15 @@ pub fn crate_patcher(input: TokenStream) -> TokenStream {
 
     let o_crate_dir = w_dir.join(original_crate_dir);
     // sync code and apply patches
-    let crate_files: Vec<_> = glob::glob(&format!("{}/**/*", o_crate_dir.to_str().unwrap()))
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|x| x.is_file() && x.file_name().unwrap().to_str().unwrap() != "Cargo.toml")
-        .map(|x| x.strip_prefix(o_crate_dir.clone()).unwrap().to_path_buf())
-        .collect();
+    let crate_files: Vec<_> = glob::glob(&format!(
+        "{}/**/*",
+        o_crate_dir.join(&lib_src_root).to_str().unwrap()
+    ))
+    .unwrap()
+    .filter_map(Result::ok)
+    .filter(|x| x.is_file() && x.file_name().unwrap().to_str().unwrap() != "Cargo.toml")
+    .map(|x| x.strip_prefix(o_crate_dir.clone()).unwrap().to_path_buf())
+    .collect();
 
     let current_files: Vec<_> = glob::glob(&format!("{}/src/**/*", dir.to_str().unwrap()))
         .unwrap()
@@ -180,15 +206,20 @@ pub fn crate_patcher(input: TokenStream) -> TokenStream {
     //     .collect();
 
     for crate_file in crate_files.iter() {
-        let _ = std::fs::create_dir_all(dir.join("./src").join(crate_file).parent().unwrap());
+        let target_crate_file = crate_file
+            .strip_prefix(lib_src_root.as_str())
+            .unwrap()
+            .to_path_buf();
+        let _ =
+            std::fs::create_dir_all(dir.join("./src").join(&target_crate_file).parent().unwrap());
         let original_content = {
             match std::fs::read_to_string(o_crate_dir.join(crate_file)) {
                 Ok(x) => x,
                 // probabely binary, just copy it over
                 Err(_) => {
-                    if !current_files.contains(crate_file) {
+                    if !current_files.contains(&target_crate_file) {
                         let from = o_crate_dir.join(crate_file);
-                        let to = dir.join("./src").join(crate_file);
+                        let to = dir.join("./src").join(target_crate_file);
                         if std::fs::copy(&from, &to).is_err() {
                             panic!("copy failed {:?} -> {:?}", from, to);
                         }
@@ -211,7 +242,7 @@ pub fn crate_patcher(input: TokenStream) -> TokenStream {
         let current_files_name = if crate_file.file_name().unwrap().to_str().unwrap() == "lib.rs" {
             PathBuf::from_str("lib.crate.rs").unwrap()
         } else {
-            crate_file.clone()
+            target_crate_file.clone()
         };
         let target = dir.join("./src").join(&current_files_name);
 
@@ -220,6 +251,8 @@ pub fn crate_patcher(input: TokenStream) -> TokenStream {
         } else {
             let current_file_content = std::fs::read_to_string(target).unwrap();
             if current_file_content == content {
+                // FIXME: i don't know why this is buggy
+                // let _ = std::fs::remove_file(dir.join(patch_file_name));
                 continue;
             }
 
@@ -235,9 +268,7 @@ pub fn crate_patcher(input: TokenStream) -> TokenStream {
         }
     }
 
-    // FIXME: if the structure of crate includes ./src folder, this doesn't work
-
-    r#"include!("./lib.crate.rs")"#.parse().unwrap()
+    r#"include!("./lib.crate.rs");"#.parse().unwrap()
 }
 
 fn crate_file_to_patch_file(crate_file_name: &PathBuf) -> PathBuf {
